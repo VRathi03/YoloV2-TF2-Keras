@@ -148,5 +148,5 @@ def build_model(image_h, image_w, grid_h, grid_w, box, classes, true_box_buffer)
 
     model = Model([input_image, true_boxes], output)
 
-    return model
+    return model, true_boxes
 

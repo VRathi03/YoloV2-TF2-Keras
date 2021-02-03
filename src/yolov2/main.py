@@ -7,10 +7,14 @@ from tensorflow.keras.utils import Sequence
 
 from config import parser
 from data_reader import parse_annotation, ImageReader
-from losses import get_cell_grid, adjust_scale_prediction, print_min_max
+from losses import get_cell_grid, adjust_scale_prediction, print_min_max, extract_ground_truth, calc_loss_xywh, \
+    calc_loss_class, calc_IOU_pred_true_assigned, calc_IOU_pred_true_best, get_conf_mask, calc_loss_conf
 from model import build_model
-from utils import get_project_root, set_pre_trained_weights, initialize_weights
+from utils import get_project_root, set_pre_trained_weights, initialize_weights, normalize
 from yolo_backend import BestAnchorBoxFinder, rescale_center_wh, rescale_center_xy
+
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from tensorflow.keras.optimizers import SGD, Adam, RMSprop
 
 np.random.seed(1)
 base_path = get_project_root()
@@ -217,8 +221,73 @@ class SimpleBatchGenerator(Sequence):
 
 """ ################  SECTION 3 - LOSS  ####################### """
 # Loss Functions
+lambda_no_object = 1.0
+lambda_object = 5.0
+lambda_coord = 1.0
+lambda_class = 1.0
+
+
+def custom_loss(y_true, y_pred, true_boxes):
+    """
+    y_true : (N batch, N grid h, N grid w, N anchor, 4 + 1 + N classes)
+    y_true[irow, i_gridh, i_gridw, i_anchor, :4] = center_x, center_y, w, h
+
+        center_x : The x coordinate center of the bounding box.
+                   Rescaled to range between 0 and N gird  w (e.g., ranging between [0,13)
+        center_y : The y coordinate center of the bounding box.
+                   Rescaled to range between 0 and N gird  h (e.g., ranging between [0,13)
+        w        : The width of the bounding box.
+                   Rescaled to range between 0 and N gird  w (e.g., ranging between [0,13)
+        h        : The height of the bounding box.
+                   Rescaled to range between 0 and N gird  h (e.g., ranging between [0,13)
+
+    y_true[irow, i_gridh, i_gridw, i_anchor, 4] = ground truth confidence
+
+        ground truth confidence is 1 if object exists in this (anchor box, gird cell) pair
+
+    y_true[irow, i_gridh, i_gridw, i_anchor, 5 + iclass] = 1 if the object is in category  else 0
+
+    """
+    total_recall = tf.Variable(0.)
+
+    # Step 1: Adjust prediction output
+    cell_grid = get_cell_grid(grid_w, grid_h, batch_size, box)
+    pred_box_xy, pred_box_wh, pred_box_conf, pred_box_class = adjust_scale_prediction(y_pred, cell_grid, anchors)
+
+    # Step 2: Extract ground truth output
+    true_box_xy, true_box_wh, true_box_conf, true_box_class = extract_ground_truth(y_true)
+
+    # Step 3: Calculate loss for the bounding box parameters
+    loss_xywh, coord_mask = calc_loss_xywh(true_box_conf, lambda_coord,
+                                           true_box_xy, pred_box_xy, true_box_wh, pred_box_wh)
+
+    # Step 4: Calculate loss for the class probabilities
+    loss_class = calc_loss_class(true_box_conf, lambda_class,
+                                 true_box_class, pred_box_class)
+
+    # Step 5: For each (grid cell, anchor) pair,
+    #         calculate the IoU between predicted and ground truth bounding box
+    true_box_conf_IOU = calc_IOU_pred_true_assigned(true_box_conf,
+                                                    true_box_xy, true_box_wh,
+                                                    pred_box_xy, pred_box_wh)
+
+    # Step 6: For each predicted bounded box from (grid cell, anchor box),
+    #         calculate the best IOU, regardless of the ground truth anchor box that each object gets assigned.
+    best_ious = calc_IOU_pred_true_best(pred_box_xy, pred_box_wh, true_boxes)
+
+    # Step 7: For each grid cell, calculate the L_{i,j}^{noobj}
+    conf_mask = get_conf_mask(best_ious, true_box_conf, true_box_conf_IOU, lambda_no_object, lambda_object)
+
+    # Step 8: Calculate loss for the confidence
+    loss_conf = calc_loss_conf(conf_mask, true_box_conf_IOU, pred_box_conf)
+
+    loss = loss_xywh + loss_conf + loss_class
+
+    return loss
+
 
 """ ################  SECTION 4  ####################### """
+
 # TODO Sort this from config file
 anchors = np.array([0.08285376, 0.13705531,
                     0.20850361, 0.39420716,
@@ -249,7 +318,7 @@ generator_config = {
 
 """ ################  SECTION 4  ####################### """
 # Create Model and Print Model Architecture
-model = build_model(image_h, image_w, grid_h, grid_w, box, classes, true_box_buffer)
+model, true_boxes = build_model(image_h, image_w, grid_h, grid_w, box, classes, true_box_buffer)
 
 # To Print Model Summary on Console
 # print(model.summary())
@@ -263,45 +332,43 @@ path_to_weights = os.path.join(base_path, parser.get('model', 'pre_trained_weigh
 model = set_pre_trained_weights(model, nb_conv, path_to_weights)
 
 # Initialize the final convolutional layer
-# layer = model.layers[-4]  # the last convolutional layer
-# initialize_weights(layer, sd=grid_h * grid_w)
+layer = model.layers[-4]  # the last convolutional layer
+initialize_weights(layer, sd=grid_h * grid_w)
+
+""" ################  SECTION 5  ####################### """
+# Compile the Model
+dir_log = "logs/"
+os.makedirs(dir_log, exist_ok=True)
+
+save_model_path = "/media/vkr/VKR/WorkSpace/Deep Learning Projects/yolov2/src/models"
+
+generator_config['BATCH_SIZE'] = batch_size
+
+early_stop = EarlyStopping(monitor='loss',
+                           min_delta=0.001,
+                           patience=3,
+                           mode='min',
+                           verbose=1)
+
+checkpoint = ModelCheckpoint(save_model_path + '/weights_yolo_on_voc2012.h5',
+                             monitor='loss',
+                             verbose=1,
+                             save_best_only=True,
+                             mode='min',
+                             save_freq=1)
+
+optimizer = Adam(lr=0.5e-4, beta_1=0.9, beta_2=0.999, epsilon=1e-08, decay=0.0)
+model.compile(loss=custom_loss, optimizer=optimizer)
 
 """ ############################# TESTING AREA ################################### """
+tf.config.experimental_run_functions_eagerly(True)
 
-# print("*" * 30)
-# print("Prepare Inputs")
-#
-# size = batch_size * grid_w * grid_h * box * (4 + 1 + classes)
-#
-# y_pred = np.random.normal(size=size, scale=10 / (grid_h * grid_w))
-# y_pred = y_pred.reshape(batch_size, grid_h, grid_w, box, 4 + 1 + classes)
-#
-# print("y_pred before scaling = {}".format(y_pred.shape))
-#
-# print("*" * 30)
-# print("Define Tensor Graph")
-# y_pred_tf = tf.constant(y_pred, dtype="float32")
-# cell_grid = get_cell_grid(grid_w, grid_h, batch_size, box)
-# (pred_box_xy, pred_box_wh, pred_box_conf, pred_box_class) = adjust_scale_prediction(y_pred_tf,
-#                                                                                     cell_grid,
-#                                                                                     anchors)
-# print("*" * 30 + "\noutput\n" + "*" * 30)
-#
-# print("\npred_box_xy {}".format(pred_box_xy.shape))
-#
-# for igrid_w in range(pred_box_xy.shape[2]):
-#     print_min_max(pred_box_xy[:, :, igrid_w, :, 0],
-#                   "  bounding box x at iGRID_W={:02.0f}".format(igrid_w))
-# for igrid_h in range(pred_box_xy.shape[1]):
-#     print_min_max(pred_box_xy[:, igrid_h, :, :, 1],
-#                   "  bounding box y at iGRID_H={:02.0f}".format(igrid_h))
-#
-# print("\npred_box_wh {}".format(pred_box_wh.shape))
-# print_min_max(pred_box_wh[:, :, :, :, 0], "  bounding box width ")
-# print_min_max(pred_box_wh[:, :, :, :, 1], "  bounding box height")
-#
-# print("\npred_box_conf {}".format(pred_box_conf.shape))
-# print_min_max(pred_box_conf, "  confidence ")
+train_batch_generator = SimpleBatchGenerator(train_image, generator_config,
+                                             norm=normalize, shuffle=True)
 
-# print("\npred_box_class {}".format(pred_box_class.shape))
-# print_min_max(pred_box_class, "  class probability")
+model.fit_generator(generator=train_batch_generator,
+                    steps_per_epoch=len(train_batch_generator),
+                    epochs=50,
+                    verbose=1,
+                    callbacks=[early_stop, checkpoint],
+                    max_queue_size=3)
